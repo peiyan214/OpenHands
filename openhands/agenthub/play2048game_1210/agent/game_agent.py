@@ -1,17 +1,18 @@
 # agent/game_agent.py
 import os
 import sys
+import time
 from collections import deque
 from typing import Deque, List, Optional, Dict, Any
-from litellm import ModelResponse
+from litellm import ModelResponse, APIError
 
 from openhands.agenthub.play2048game_1210.agent.config import AgentConfig, LLMRegistry, State
 from openhands.agenthub.play2048game_1210.tools.tool_constants import TOOL_NAMES, GAME_URL
 from openhands.agenthub.play2048game_1210.tools.tools import get_tools
 from openhands.agenthub.play2048game_1210.agent.function_calling import response_to_actions
-
-from openhands.agenthub.play2048game_1210.core.actions import Action, AgentFinishAction, AgentThinkAction, MessageAction
+from openhands.agenthub.play2048game_1210.core.actions import Action, AgentFinishAction, AgentThinkAction, MessageAction,GetGameState2048Action
 from openhands.agenthub.play2048game_1210.core.observation import Game2048Observation
+
 
 # 核心2048 Agent类（仅保留游戏相关逻辑）
 class Play2048Agent:
@@ -30,6 +31,8 @@ class Play2048Agent:
         self.tools = get_tools(config, config.use_short_tool_desc)
 
         self.llm = self.llm_registry.get_router(config)
+        self.error_time: int = 0  
+        self.max_error_times: int = 5  
 
     def reset(self) -> None:
         """重置Agent游戏状态"""
@@ -40,6 +43,11 @@ class Play2048Agent:
 
     def step(self, state: State) -> Action:
         """核心游戏步骤处理"""
+        if self.error_time >= self.max_error_times:
+            print(f"❌ 累计错误次数达到{self.max_error_times}次，结束游戏")
+            self.game_over = True
+            return AgentFinishAction()
+        
         if self.pending_actions:
             return self.pending_actions.popleft()
         
@@ -53,7 +61,39 @@ class Play2048Agent:
         self._log_states(game_state_now)
 
         params = self._build_llm_params(messages, state)
-        response = self.llm.completion(** params)
+        # response = self.llm.completion(** params)
+
+        max_retries = 2  # try 2 times
+        retry_count = 0
+        response = None
+        
+        while retry_count < max_retries:
+            try:
+                response = self.llm.completion(** params)
+                # print(f"response is {response}")
+                
+                # 判断响应是否"正常"：非空 + 有有效内容
+                if self._is_valid_response(response):
+                    break 
+                else:
+                    print(f"⚠️ 第 {retry_count+1} 次调用返回空/无效响应，重试...")
+                    retry_count += 1
+                    time.sleep(1)  # 重试间隔1秒
+                    
+            except APIError as e:
+                # 捕获API异常，打印信息后重试
+                print(f"⚠️ 第 {retry_count+1} 次调用报错：{str(e)}，重试...")
+                retry_count += 1
+                time.sleep(1)
+
+        # 重试耗尽/响应仍无效 → 降级为getstate动作
+        if not self._is_valid_response(response):
+            self.error_time += 1  
+            print(f"❌ invalid response, error times:{self.error_time}/{self.max_error_times}, try getstate action")
+            thought = ''
+            action = GetGameState2048Action(thought=thought)
+            self.pending_actions.append(action)
+            return self.pending_actions.popleft()
 
         actions = self.response_to_actions(response)
 
@@ -62,6 +102,23 @@ class Play2048Agent:
 
         return self.pending_actions.popleft()
 
+    def _is_valid_response(self, response) -> bool:
+        """判断响应是否有效（自定义规则）"""
+        if response is None:
+            return False
+        # 1. choices exist or not
+        if not hasattr(response, 'choices') or len(response.choices) == 0:
+            return False
+        # 2. choices[0] is efficient or not
+        first_choice = response.choices[0]
+        if not hasattr(first_choice, 'message'):
+            return False
+        # 3. tool_calls exist or not
+        message = first_choice.message
+        if not hasattr(message, 'tool_calls') or len(message.tool_calls) == 0:
+            return False
+        return True
+    
     def _get_initial_user_message(self, history: List[Any]) -> MessageAction:
         """获取初始用户消息"""
         for event in history:

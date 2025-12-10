@@ -4,7 +4,7 @@ steps: 65535
 llm:
   model: "openrouter/x-ai/grok-4-fast"
   api_url: "https://openrouter.ai/api/v1"
-  api_key: "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"
+  api_key: ""
   short_tool_desc: false
 
 game:
